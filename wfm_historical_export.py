@@ -233,18 +233,20 @@ def fetch_aggregates(client, queue_id, chunk_start, chunk_end, tz_name):
 
 def parse_interval_start(interval_str, tz):
     """Genesys interval strings look like
-    '2026-09-15T09:00:00.000Z/2026-09-15T09:15:00.000Z'. Return the start,
-    converted to the requested local time zone, naive for display."""
+    '2026-09-15T09:00:00.000Z/2026-09-15T09:15:00.000Z' when no timeZone is
+    given, but return the LOCAL offset (e.g. '...+01:00') once a timeZone
+    parameter is supplied on the query, so we can't assume 'Z'. Parse
+    whichever form comes back and return the start, converted to the
+    requested local time zone, naive for display."""
     start_str = interval_str.split("/")[0]
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            dt_utc = datetime.strptime(start_str, fmt).replace(tzinfo=timezone.utc)
-            break
-        except ValueError:
-            continue
-    else:
-        raise ValueError(f"Unrecognized interval format: {interval_str!r}")
-    return dt_utc.astimezone(tz).replace(tzinfo=None)
+    # datetime.fromisoformat handles both 'Z' (after normalizing to
+    # '+00:00') and explicit '+HH:MM' offsets, across Python 3.9+.
+    normalized = start_str[:-1] + "+00:00" if start_str.endswith("Z") else start_str
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Unrecognized interval format: {interval_str!r}") from exc
+    return dt.astimezone(tz).replace(tzinfo=None)
 
 
 def process_results(results, tz, rows):
@@ -304,16 +306,26 @@ def main():
             "to run: pip install tzdata"
         )
 
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(weeks=weeks)
+    # Round the query range to clean 15-minute boundaries in LOCAL time
+    # before building the query. If the range starts/ends at an arbitrary
+    # instant (e.g. "now" with odd seconds/microseconds), every 15-minute
+    # bucket Genesys returns inherits that same offset instead of landing
+    # on :00/:15/:30/:45 -- which is what produced misaligned intervals
+    # like '10:44:22' instead of '10:45:00'.
+    now_local = datetime.now(tz)
+    end_local = now_local.replace(second=0, microsecond=0)
+    end_local = end_local.replace(minute=(end_local.minute // 15) * 15)
+    start_local = end_local - timedelta(weeks=weeks)
 
     rows = defaultdict(lambda: {"offered": 0, "handled": 0, "handle_time": 0.0})
 
-    print(f"\nQuerying aggregates from {start_dt.date()} to {end_dt.date()} "
-          f"(time zone: {tz_name})...")
-    for chunk_start, chunk_end in date_chunks(start_dt, end_dt, CHUNK_DAYS):
-        print(f"  chunk {chunk_start.date()} -> {chunk_end.date()} ...")
-        results = fetch_aggregates(client, queue_id, chunk_start, chunk_end, tz_name)
+    print(f"\nQuerying aggregates from {start_local} to {end_local} "
+          f"(local time, {tz_name})...")
+    for chunk_start_local, chunk_end_local in date_chunks(start_local, end_local, CHUNK_DAYS):
+        print(f"  chunk {chunk_start_local.date()} -> {chunk_end_local.date()} ...")
+        chunk_start_utc = chunk_start_local.astimezone(timezone.utc)
+        chunk_end_utc = chunk_end_local.astimezone(timezone.utc)
+        results = fetch_aggregates(client, queue_id, chunk_start_utc, chunk_end_utc, tz_name)
         process_results(results, tz, rows)
 
     if not rows:

@@ -2,7 +2,7 @@
 """
 wfm_historical_export.py
 
-Pulls per-15-minute-interval historical Offered / Handled / Total Handle Time
+Pulls per-30-minute-interval historical Offered / Handled / Total Handle Time
 data for a single Genesys Cloud queue (voice media only), for use in the WFM
 "historical_data" import template:
 
@@ -42,10 +42,10 @@ How it works
 2. Resolves the queue name you type to its queue ID.
 3. Runs the aggregates query in <=7-day chunks (to stay well under any
    per-request interval/bucket-count limit) across the requested number of
-   weeks back (max 12), with granularity PT15M and a filter on this queue's
+   weeks back (max 12), with granularity PT30M and a filter on this queue's
    ID and mediaType=voice, and timeZone set to the IANA zone you provide so
-   interval boundaries land on local-time quarter-hours.
-4. Writes a CSV, one row per 15-minute interval that had any activity, plus
+   interval boundaries land on local-time half-hours.
+4. Writes a CSV, one row per 30-minute interval that had any activity, plus
    a totals line printed to the console so you can do a quick sanity check
    against the Queue Performance Detail view before trusting the file.
 
@@ -89,7 +89,8 @@ import requests
 
 MAX_WEEKS = 12
 CHUNK_DAYS = 7          # keep each aggregates query request to a safe size
-GRANULARITY = "PT15M"   # 15-minute buckets
+GRANULARITY = "PT30M"   # 30-minute buckets
+INTERVAL_MINUTES = 30   # must match GRANULARITY, used for boundary rounding
 
 MEDIA_TYPE = "voice"    # hardcoded per requirements
 LANGUAGE = "english"    # hardcoded per requirements
@@ -306,15 +307,15 @@ def main():
             "to run: pip install tzdata"
         )
 
-    # Round the query range to clean 15-minute boundaries in LOCAL time
+    # Round the query range to clean 30-minute boundaries in LOCAL time
     # before building the query. If the range starts/ends at an arbitrary
-    # instant (e.g. "now" with odd seconds/microseconds), every 15-minute
+    # instant (e.g. "now" with odd seconds/microseconds), every 30-minute
     # bucket Genesys returns inherits that same offset instead of landing
-    # on :00/:15/:30/:45 -- which is what produced misaligned intervals
-    # like '10:44:22' instead of '10:45:00'.
+    # on :00/:30 -- which is what produced misaligned intervals like
+    # '10:44:22' instead of '11:00:00'.
     now_local = datetime.now(tz)
     end_local = now_local.replace(second=0, microsecond=0)
-    end_local = end_local.replace(minute=(end_local.minute // 15) * 15)
+    end_local = end_local.replace(minute=(end_local.minute // INTERVAL_MINUTES) * INTERVAL_MINUTES)
     start_local = end_local - timedelta(weeks=weeks)
 
     rows = defaultdict(lambda: {"offered": 0, "handled": 0, "handle_time": 0.0})

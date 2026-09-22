@@ -21,10 +21,13 @@ How it works
    for the requested number of weeks back (max 12), in <=7-day chunks (the
    API's max query interval), paginating with the cursor until exhausted.
 4. Walks each conversation's participants/sessions/segments to work out:
-      - when the interaction was offered to this queue (segment purpose "queue")
-      - when/if it was actually handled by an agent (purpose "user", i.e.
-        connected talk/hold/wrap-up time) tied to this queue
-      - the skills requested on that interaction (requestedRoutingSkillIds)
+      - when the interaction was offered to this queue (a participant with
+        purpose "acd" having a segment with queueId == our queue)
+      - when/if it was actually handled by an agent (a participant with
+        purpose "agent" having a segment on our queue with segmentType
+        "interact", "hold", or "wrapup" -- talk/hold/after-call-work)
+      - the skills requested on that interaction (requestedRoutingSkillIds,
+        which lives on the segment, not the session)
 5. Buckets everything into 15-minute local-time intervals and aggregates
    Offered / Interactions Handled / Total Handle Time (seconds), split out by
    the skill-set combination on each interaction.
@@ -273,57 +276,65 @@ def process_conversation(conv, queue_id, skill_names, tz_offset_minutes, buckets
     Update `buckets` (a dict keyed on (interval_start, skill_label)) with
     Offered / Handled / TotalHandleTime contributions from this conversation.
 
-    Segment-matching logic (see module docstring for validation guidance):
-      - "Offered": the first segment with purpose == "queue" and
-        queueId == our queue marks one offered interaction, bucketed at that
-        segment's startTime.
-      - "Handled": if the same conversation also has a segment with
-        purpose == "user" tied to an agent participant whose associated
-        queueId == our queue, it counts as handled, bucketed at the *queue*
-        segment's startTime (i.e. when it was offered) -- change to the
-        agent-connect time if your WFM process expects that instead.
-      - "Total Handle Time": sum of segment durations with
-        purpose in {"user", "hold"} (talk + hold) plus any purpose == "wrapup"
-        segment durations, for agent participants tied to our queue, in
-        seconds.
-      - Skills: requestedRoutingSkillIds found on the customer/acd
-        participant's session, if present.
+    This is based on Genesys Cloud's actual analytics conversation-detail
+    schema (participant.purpose enum, segment.segmentType enum, and the
+    fact that queueId and requestedRoutingSkillIds live on the *segment*,
+    not the session):
+
+      - "Offered": a participant with purpose == "acd" represents the
+        interaction's engagement with ACD/queue routing. Any segment on
+        that participant with queueId == our queue marks one offered
+        interaction. We bucket it at the earliest such segment's
+        segmentStart.
+      - "Handled": a participant with purpose == "agent" having a segment
+        on our queue with segmentType in {"interact", "hold", "wrapup"}
+        (i.e. talk, hold, or after-call work) counts as handled.
+      - "Total Handle Time": sum of segment durations (segmentEnd -
+        segmentStart) for that agent participant's segments on our queue
+        with segmentType in {"interact", "hold", "wrapup"} -- i.e. talk +
+        hold + ACW, matching Genesys's own tHandle definition.
+      - Skills: requestedRoutingSkillIds found on any segment (on our
+        queue) across all participants.
+
+    See the module docstring for how to validate this against Genesys's
+    own aggregate metrics before trusting it for a real forecast import.
     """
     skill_ids = set()
-    offered_hit = None
+    offered_time = None
     handled = False
-    handle_time_seconds = 0
+    handle_time_seconds = 0.0
 
     for participant in conv.get("participants", []):
         purpose = participant.get("purpose")
         for session in participant.get("sessions", []):
-            for rid in session.get("requestedRoutingSkillIds") or []:
-                skill_ids.add(rid)
-
             for segment in session.get("segments", []):
-                seg_purpose = segment.get("segmentType") or segment.get("purpose")
-                seg_queue = segment.get("queueId")
-                if seg_queue != queue_id:
+                if segment.get("queueId") != queue_id:
                     continue
 
-                start = segment.get("segmentStart") or segment.get("startTime")
-                end = segment.get("segmentEnd") or segment.get("endTime")
+                for rid in segment.get("requestedRoutingSkillIds") or []:
+                    skill_ids.add(rid)
 
-                if seg_purpose == "queue" and offered_hit is None and start:
-                    offered_hit = parse_ts(start)
+                seg_type = segment.get("segmentType")
+                start = segment.get("segmentStart")
+                end = segment.get("segmentEnd")
 
-                if purpose == "agent" and seg_purpose in ("user", "hold", "wrapup"):
+                if purpose == "acd" and start:
+                    t = parse_ts(start)
+                    if offered_time is None or t < offered_time:
+                        offered_time = t
+
+                if purpose == "agent" and seg_type in ("interact", "hold", "wrapup"):
                     handled = True
                     if start and end:
                         delta = (parse_ts(end) - parse_ts(start)).total_seconds()
                         handle_time_seconds += max(delta, 0)
 
-    if offered_hit is None:
-        # No matching "queue" segment for this queue in this conversation;
+    if offered_time is None:
+        # No "acd" participant segment for this queue in this conversation;
         # nothing to attribute here.
         return
 
-    bucket_time = floor_to_interval(offered_hit, tz_offset_minutes)
+    bucket_time = floor_to_interval(offered_time, tz_offset_minutes)
     label = skill_set_label(skill_ids, skill_names)
     key = (bucket_time, label)
 

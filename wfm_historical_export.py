@@ -2,61 +2,74 @@
 """
 wfm_historical_export.py
 
-Pulls per-15-minute-interval historical interaction data for a single Genesys
-Cloud queue and writes it out in a layout matching the WFM "historical_data"
-import template:
+Pulls per-15-minute-interval historical Offered / Handled / Total Handle Time
+data for a single Genesys Cloud queue (voice media only), for use in the WFM
+"historical_data" import template:
 
-    Interval Start Date, Queue, Media Type, Skill Set, Language,
-    Offered, Interactions Handled, Total Handle Time
+    Interval Start Date, Queue, Media Type, Language, Offered,
+    Interactions Handled, Total Handle Time
+
+This version uses Genesys Cloud's own pre-computed analytics AGGREGATES
+endpoint (POST /api/v2/analytics/conversations/aggregates/query) -- the same
+endpoint the Genesys Cloud "Queue Performance Detail" view itself is built
+on -- rather than reconstructing counts from raw conversation details. That
+means the numbers this script produces should match what you see in the
+Genesys Cloud UI for the same queue/date range/media type, because they come
+from the same source metrics.
+
+Metrics used, and why
+----------------------
+  - "Offered"             -> metric `nOffered`,  statistic: count
+  - "Interactions Handled" -> metric `tHandle`,   statistic: count
+  - "Total Handle Time"    -> metric `tHandle`,   statistic: sum (ms -> s)
+
+Note: Genesys Cloud draws a real distinction between "Answered" (nConnected
+-- an agent accepted the interaction) and "Handle" (tHandle -- talk + hold +
+after-call-work all completed, e.g. after wrap-up is submitted). These can
+differ, especially around transfers: a transferred call can be Answered by
+one agent and Handled (wrap-up completed) by another. Since you asked for
+"Interactions Handled", this script uses tHandle's count, not nConnected.
+If what you actually want to match is an "Answered" column instead, that
+would be `nConnected` -- let me know and this is a one-line change.
 
 How it works
 ------------
-1. Authenticates against Genesys Cloud using an OAuth Client Credentials grant
-   (Client ID + Client Secret) -- these are requested at runtime, never stored
-   on disk. If GENESYSCLOUD_CLIENT_ID / GENESYSCLOUD_CLIENT_SECRET /
-   GENESYSCLOUD_REGION env vars are already set in your shell, those are used
-   instead and you won't be prompted.
+1. Authenticates using an OAuth Client Credentials grant (Client ID +
+   Client Secret), requested at runtime and never written to disk. If
+   GENESYSCLOUD_REGION / GENESYSCLOUD_CLIENT_ID / GENESYSCLOUD_CLIENT_SECRET
+   env vars are already set, those are used instead and you won't be
+   prompted.
 2. Resolves the queue name you type to its queue ID.
-3. Pulls conversation details (POST /api/v2/analytics/conversations/details/query)
-   for the requested number of weeks back (max 12), in <=7-day chunks (the
-   API's max query interval), paginating with the cursor until exhausted.
-4. Walks each conversation's participants/sessions/segments to work out:
-      - when the interaction was offered to this queue (a participant with
-        purpose "acd" having a segment with queueId == our queue)
-      - when/if it was actually handled by an agent (a participant with
-        purpose "agent" having a segment on our queue with segmentType
-        "interact", "hold", or "wrapup" -- talk/hold/after-call-work)
-      - the skills requested on that interaction (requestedRoutingSkillIds,
-        which lives on the segment, not the session)
-5. Buckets everything into 15-minute local-time intervals and aggregates
-   Offered / Interactions Handled / Total Handle Time (seconds), split out by
-   the skill-set combination on each interaction.
-6. Writes a CSV.
+3. Runs the aggregates query in <=7-day chunks (to stay well under any
+   per-request interval/bucket-count limit) across the requested number of
+   weeks back (max 12), with granularity PT15M and a filter on this queue's
+   ID and mediaType=voice, and timeZone set to the IANA zone you provide so
+   interval boundaries land on local-time quarter-hours.
+4. Writes a CSV, one row per 15-minute interval that had any activity, plus
+   a totals line printed to the console so you can do a quick sanity check
+   against the Queue Performance Detail view before trusting the file.
 
-IMPORTANT -- please read before trusting the output
-----------------------------------------------------
-Genesys Cloud's own "offered" / "handled" / "handle time" analytics metrics
-(nOffered, nHandled, tHandle, etc.) are computed by Genesys internally from
-the full segment model, and are exposed cleanly via the *aggregates* endpoint
--- but that endpoint doesn't break results out by skill set, which is why
-this script reconstructs the numbers itself from raw conversation *details*.
-
-The reconstruction logic below is a reasonable, documented best-effort
-mapping (see the comments in `process_conversation`), but it has NOT been
-validated against Genesys's own aggregate totals. Before relying on this data
-for a real forecast:
-
-    1. Run this script for a queue and week.
-    2. Separately pull `gc analytics conversations aggregates query` (or the
-       Performance > Queue Activity view) totals for the same queue/week.
-    3. Compare "Offered" and "Handled" totals and total handle time. If they
-       don't match within a small tolerance, the segment-matching logic below
-       will need adjusting for your org's routing configuration (e.g. IVR
-       hand-offs, transfers, conferences) before it's safe to import.
+IMPORTANT -- validate before importing into a real forecast
+-------------------------------------------------------------
+Even using Genesys's own aggregate metrics, please spot-check: pick one day
+from the output CSV, sum that day's Offered / Interactions Handled / Total
+Handle Time, and compare against the Queue Performance Detail view for that
+same queue, day and media type (voice) in the Genesys Cloud UI. They should
+match closely. If they don't, the most likely causes are:
+  - Time zone: this script buckets using the IANA zone you enter; make sure
+    it's the same zone your report view is displaying in.
+  - Genesys Cloud's own "recalculation window" can revise recent data for a
+    short period after conversations complete -- a same-day comparison for
+    "today" can show small drift; compare a fully completed prior day.
+  - If the report shows "Answered" rather than "Handled" for its interaction
+    count column, it will differ slightly from this script's tHandle-based
+    count (see note above) -- switch to nConnected if that's the column you
+    are matching against.
 
 Requirements
 ------------
     pip install requests
+    (Windows only, if you hit a timezone error: pip install tzdata)
 
 Usage
 -----
@@ -70,16 +83,16 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
 MAX_WEEKS = 12
-INTERVAL_MINUTES = 15
-CHUNK_DAYS = 7  # max span per details query request
-PAGE_SIZE = 100  # conversation details query page size (max 100)
+CHUNK_DAYS = 7          # keep each aggregates query request to a safe size
+GRANULARITY = "PT15M"   # 15-minute buckets
 
-MEDIA_TYPE = "voice"     # hardcoded per requirements
-LANGUAGE = "english"     # hardcoded per requirements
+MEDIA_TYPE = "voice"    # hardcoded per requirements
+LANGUAGE = "english"    # hardcoded per requirements
 
 
 # --------------------------------------------------------------------------
@@ -149,7 +162,7 @@ class GenesysClient:
                 sys.exit(
                     f"403 Forbidden calling {path}. The OAuth client's "
                     "assigned role likely lacks the required permission "
-                    "(e.g. Analytics > Conversation Detail > View, "
+                    "(e.g. Analytics > Conversation Aggregate > View, "
                     "Routing > Queue > View)."
                 )
             if resp.status_code >= 400:
@@ -165,7 +178,7 @@ class GenesysClient:
 
 
 # --------------------------------------------------------------------------
-# Queue / skill lookups
+# Queue lookup
 # --------------------------------------------------------------------------
 
 def resolve_queue(client, queue_name):
@@ -176,7 +189,6 @@ def resolve_queue(client, queue_name):
     entities = data.get("entities", [])
     if not entities:
         sys.exit(f"No queue found matching name '{queue_name}'.")
-    # Prefer an exact (case-insensitive) match if there is one
     exact = [e for e in entities if e["name"].lower() == queue_name.lower()]
     match = exact[0] if exact else entities[0]
     if len(entities) > 1 and not exact:
@@ -185,28 +197,11 @@ def resolve_queue(client, queue_name):
     return match["id"], match["name"]
 
 
-def load_skill_names(client):
-    """Returns {skillId: skillName} for all routing skills in the org."""
-    skills = {}
-    page = 1
-    while True:
-        data = client.get(
-            "/api/v2/routing/skills", params={"pageSize": 500, "pageNumber": page}
-        )
-        for entity in data.get("entities", []):
-            skills[entity["id"]] = entity["name"]
-        if page >= data.get("pageCount", 1):
-            break
-        page += 1
-    return skills
-
-
 # --------------------------------------------------------------------------
-# Conversation details fetch + processing
+# Aggregates query
 # --------------------------------------------------------------------------
 
 def date_chunks(start, end, chunk_days):
-    """Yield (chunk_start, chunk_end) datetime tuples covering [start, end)."""
     cur = start
     while cur < end:
         nxt = min(cur + timedelta(days=chunk_days), end)
@@ -214,135 +209,59 @@ def date_chunks(start, end, chunk_days):
         cur = nxt
 
 
-def fetch_conversations(client, queue_id, interval_start, interval_end):
-    """Paginate through conversation details for one date chunk."""
-    conversations = []
-    cursor = None
-    while True:
-        body = {
-            "interval": (
-                f"{interval_start.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z/"
-                f"{interval_end.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z"
-            ),
-            "order": "asc",
-            "orderBy": "conversationStart",
-            "paging": {"pageSize": PAGE_SIZE},
-            "segmentFilters": [
-                {
-                    "type": "and",
-                    "predicates": [{"dimension": "queueId", "value": queue_id}],
-                }
+def fmt_iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def fetch_aggregates(client, queue_id, chunk_start, chunk_end, tz_name):
+    body = {
+        "interval": f"{fmt_iso(chunk_start)}/{fmt_iso(chunk_end)}",
+        "granularity": GRANULARITY,
+        "timeZone": tz_name,
+        "filter": {
+            "type": "and",
+            "predicates": [
+                {"type": "dimension", "dimension": "queueId", "value": queue_id},
+                {"type": "dimension", "dimension": "mediaType", "value": MEDIA_TYPE},
             ],
-        }
-        if cursor:
-            body["cursor"] = cursor
-        data = client.post("/api/v2/analytics/conversations/details/query", json=body)
-        conversations.extend(data.get("conversations", []))
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-    return conversations
+        },
+        "metrics": ["nOffered", "tHandle"],
+    }
+    data = client.post("/api/v2/analytics/conversations/aggregates/query", json=body)
+    return data.get("results", [])
 
 
-def floor_to_interval(dt_utc, tz_offset_minutes):
-    """Floor a UTC datetime to the start of its N-minute local interval,
-    returning a naive local datetime (for display in the output)."""
-    local = dt_utc + timedelta(minutes=tz_offset_minutes)
-    floored_minute = (local.minute // INTERVAL_MINUTES) * INTERVAL_MINUTES
-    return local.replace(minute=floored_minute, second=0, microsecond=0)
-
-
-def parse_ts(ts):
-    """Parse a Genesys Cloud ISO-8601 UTC timestamp. Genesys sometimes omits
-    fractional seconds (e.g. '2026-09-15T09:46:54Z' instead of
-    '2026-09-15T09:46:54.123Z'), so try both formats."""
+def parse_interval_start(interval_str, tz):
+    """Genesys interval strings look like
+    '2026-09-15T09:00:00.000Z/2026-09-15T09:15:00.000Z'. Return the start,
+    converted to the requested local time zone, naive for display."""
+    start_str = interval_str.split("/")[0]
     for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
         try:
-            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+            dt_utc = datetime.strptime(start_str, fmt).replace(tzinfo=timezone.utc)
+            break
         except ValueError:
             continue
-    raise ValueError(f"Unrecognized timestamp format: {ts!r}")
+    else:
+        raise ValueError(f"Unrecognized interval format: {interval_str!r}")
+    return dt_utc.astimezone(tz).replace(tzinfo=None)
 
 
-def skill_set_label(skill_ids, skill_names):
-    if not skill_ids:
-        return "None"
-    names = sorted(skill_names.get(sid, sid) for sid in skill_ids)
-    return "|".join(names)
-
-
-def process_conversation(conv, queue_id, skill_names, tz_offset_minutes, buckets):
-    """
-    Update `buckets` (a dict keyed on (interval_start, skill_label)) with
-    Offered / Handled / TotalHandleTime contributions from this conversation.
-
-    This is based on Genesys Cloud's actual analytics conversation-detail
-    schema (participant.purpose enum, segment.segmentType enum, and the
-    fact that queueId and requestedRoutingSkillIds live on the *segment*,
-    not the session):
-
-      - "Offered": a participant with purpose == "acd" represents the
-        interaction's engagement with ACD/queue routing. Any segment on
-        that participant with queueId == our queue marks one offered
-        interaction. We bucket it at the earliest such segment's
-        segmentStart.
-      - "Handled": a participant with purpose == "agent" having a segment
-        on our queue with segmentType in {"interact", "hold", "wrapup"}
-        (i.e. talk, hold, or after-call work) counts as handled.
-      - "Total Handle Time": sum of segment durations (segmentEnd -
-        segmentStart) for that agent participant's segments on our queue
-        with segmentType in {"interact", "hold", "wrapup"} -- i.e. talk +
-        hold + ACW, matching Genesys's own tHandle definition.
-      - Skills: requestedRoutingSkillIds found on any segment (on our
-        queue) across all participants.
-
-    See the module docstring for how to validate this against Genesys's
-    own aggregate metrics before trusting it for a real forecast import.
-    """
-    skill_ids = set()
-    offered_time = None
-    handled = False
-    handle_time_seconds = 0.0
-
-    for participant in conv.get("participants", []):
-        purpose = participant.get("purpose")
-        for session in participant.get("sessions", []):
-            for segment in session.get("segments", []):
-                if segment.get("queueId") != queue_id:
-                    continue
-
-                for rid in segment.get("requestedRoutingSkillIds") or []:
-                    skill_ids.add(rid)
-
-                seg_type = segment.get("segmentType")
-                start = segment.get("segmentStart")
-                end = segment.get("segmentEnd")
-
-                if purpose == "acd" and start:
-                    t = parse_ts(start)
-                    if offered_time is None or t < offered_time:
-                        offered_time = t
-
-                if purpose == "agent" and seg_type in ("interact", "hold", "wrapup"):
-                    handled = True
-                    if start and end:
-                        delta = (parse_ts(end) - parse_ts(start)).total_seconds()
-                        handle_time_seconds += max(delta, 0)
-
-    if offered_time is None:
-        # No "acd" participant segment for this queue in this conversation;
-        # nothing to attribute here.
-        return
-
-    bucket_time = floor_to_interval(offered_time, tz_offset_minutes)
-    label = skill_set_label(skill_ids, skill_names)
-    key = (bucket_time, label)
-
-    row = buckets[key]
-    row["offered"] += 1
-    if handled:
-        row["handled"] += 1
-        row["handle_time"] += handle_time_seconds
+def process_results(results, tz, rows):
+    """rows: dict keyed on interval_start -> {"offered":..,"handled":..,"handle_time":..}"""
+    for result in results:
+        for entry in result.get("data", []):
+            interval_start = parse_interval_start(entry["interval"], tz)
+            row = rows[interval_start]
+            for metric in entry.get("metrics", []):
+                name = metric.get("metric")
+                stats = metric.get("stats", {})
+                if name == "nOffered":
+                    row["offered"] += stats.get("count", 0) or 0
+                elif name == "tHandle":
+                    row["handled"] += stats.get("count", 0) or 0
+                    # Genesys Cloud analytics durations are in milliseconds.
+                    row["handle_time"] += (stats.get("sum", 0) or 0) / 1000.0
 
 
 # --------------------------------------------------------------------------
@@ -350,7 +269,7 @@ def process_conversation(conv, queue_id, skill_names, tz_offset_minutes, buckets
 # --------------------------------------------------------------------------
 
 def main():
-    print("=== WFM Historical Data Export ===\n")
+    print("=== WFM Historical Data Export (Offered / Handled / Handle Time) ===\n")
 
     region, client_id, client_secret = get_credentials()
     print("\nAuthenticating...")
@@ -372,33 +291,39 @@ def main():
         print(f"  please enter a whole number between 1 and {MAX_WEEKS}.")
 
     tz_input = input(
-        "Local timezone offset from UTC in minutes for bucketing "
-        "(e.g. 60 for UTC+1, 0 for UTC) [default 0]: "
+        "Time zone for interval bucketing, as an IANA name matching what "
+        "your Genesys Cloud report is displayed in (e.g. Europe/London) "
+        "[default Europe/London]: "
     ).strip()
-    tz_offset_minutes = int(tz_input) if tz_input else 0
-
-    print("\nLoading routing skill names...")
-    skill_names = load_skill_names(client)
-    print(f"  loaded {len(skill_names)} skills.\n")
+    tz_name = tz_input or "Europe/London"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        sys.exit(
+            f"Could not load time zone '{tz_name}'. On Windows you may need "
+            "to run: pip install tzdata"
+        )
 
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(weeks=weeks)
 
-    buckets = defaultdict(lambda: {"offered": 0, "handled": 0, "handle_time": 0.0})
+    rows = defaultdict(lambda: {"offered": 0, "handled": 0, "handle_time": 0.0})
 
-    print(f"Pulling conversation details from {start_dt.date()} to {end_dt.date()}...")
+    print(f"\nQuerying aggregates from {start_dt.date()} to {end_dt.date()} "
+          f"(time zone: {tz_name})...")
     for chunk_start, chunk_end in date_chunks(start_dt, end_dt, CHUNK_DAYS):
         print(f"  chunk {chunk_start.date()} -> {chunk_end.date()} ...")
-        conversations = fetch_conversations(client, queue_id, chunk_start, chunk_end)
-        print(f"    {len(conversations)} conversations returned")
-        for conv in conversations:
-            process_conversation(conv, queue_id, skill_names, tz_offset_minutes, buckets)
+        results = fetch_aggregates(client, queue_id, chunk_start, chunk_end, tz_name)
+        process_results(results, tz, rows)
 
-    if not buckets:
+    if not rows:
         print("\nNo data found for this queue/date range. No file written.")
         return
 
     out_path = f"historical_data_{queue_name.replace(' ', '_')}.csv"
+    total_offered = total_handled = 0
+    total_handle_time = 0.0
+
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -406,33 +331,42 @@ def main():
                 "Interval Start Date",
                 "Queue",
                 "Media Type",
-                "Skill Set",
                 "Language",
                 "Offered",
                 "Interactions Handled",
                 "Total Handle Time",
             ]
         )
-        for (interval_start, skill_label), row in sorted(buckets.items()):
+        for interval_start, row in sorted(rows.items()):
+            handle_time_seconds = int(round(row["handle_time"]))
             writer.writerow(
                 [
                     interval_start.strftime("%Y-%m-%d %H:%M"),
                     queue_name,
                     MEDIA_TYPE,
-                    skill_label,
                     LANGUAGE,
                     row["offered"],
                     row["handled"],
-                    int(round(row["handle_time"])),
+                    handle_time_seconds,
                 ]
             )
+            total_offered += row["offered"]
+            total_handled += row["handled"]
+            total_handle_time += handle_time_seconds
 
-    print(f"\nDone. Wrote {len(buckets)} rows to {out_path}")
+    print(f"\nDone. Wrote {len(rows)} rows to {out_path}")
     print(
-        "\nReminder: cross-check Offered/Handled/Handle Time totals against "
-        "the Genesys aggregates query or Performance view for the same "
-        "queue and date range before using this in a real forecast import "
-        "-- see the notes at the top of this script."
+        f"\nTotals across the full range -- "
+        f"Offered: {total_offered}, Handled: {total_handled}, "
+        f"Total Handle Time: {int(total_handle_time)}s "
+        f"({total_handle_time / 3600:.1f} hours)"
+    )
+    print(
+        "\nBefore importing: pick one completed day from the CSV, sum its "
+        "Offered/Handled/Handle Time, and compare against the Queue "
+        "Performance Detail view in Genesys Cloud for that queue, day and "
+        "voice media type -- see the notes at the top of this script if "
+        "they don't line up."
     )
 
 

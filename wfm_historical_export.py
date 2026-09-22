@@ -250,7 +250,15 @@ def floor_to_interval(dt_utc, tz_offset_minutes):
 
 
 def parse_ts(ts):
-    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    """Parse a Genesys Cloud ISO-8601 UTC timestamp. Genesys sometimes omits
+    fractional seconds (e.g. '2026-09-15T09:46:54Z' instead of
+    '2026-09-15T09:46:54.123Z'), so try both formats."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized timestamp format: {ts!r}")
 
 
 def skill_set_label(skill_ids, skill_names):

@@ -124,6 +124,9 @@ INTERVAL_MINUTES = 15   # must match GRANULARITY, used for boundary rounding
 MEDIA_TYPE = "voice"    # hardcoded per requirements
 LANGUAGE = "english"    # hardcoded per requirements
 
+REQUEST_PACING_SECONDS = 0.5   # small pause between chunk requests
+QUEUE_PACING_SECONDS = 1.0     # small pause between queues
+
 
 # --------------------------------------------------------------------------
 # Auth / credentials
@@ -181,8 +184,19 @@ class GenesysClient:
 
     def request(self, method, path, **kwargs):
         url = f"{self.base}{path}"
-        for attempt in range(6):
-            resp = self.session.request(method, url, timeout=60, **kwargs)
+        max_attempts = 8
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self.session.request(method, url, timeout=60, **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                if attempt == max_attempts:
+                    sys.exit(f"Network error calling {path} after {max_attempts} attempts: {exc}")
+                wait = min(30, 2 ** attempt)
+                print(f"  network error ({exc.__class__.__name__}), retrying in {wait}s "
+                      f"(attempt {attempt}/{max_attempts})...")
+                time.sleep(wait)
+                continue
+
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", "5"))
                 print(f"  rate limited, waiting {wait}s...")
@@ -195,10 +209,21 @@ class GenesysClient:
                     "(e.g. Analytics > Conversation Aggregate > View, "
                     "Routing > Queue > View)."
                 )
+            if resp.status_code in (500, 502, 503, 504):
+                if attempt == max_attempts:
+                    sys.exit(
+                        f"API error {resp.status_code} calling {path} after "
+                        f"{max_attempts} attempts: {resp.text}"
+                    )
+                wait = min(30, 2 ** attempt)
+                print(f"  Genesys returned {resp.status_code} (likely a transient "
+                      f"service issue), retrying in {wait}s (attempt {attempt}/{max_attempts})...")
+                time.sleep(wait)
+                continue
             if resp.status_code >= 400:
                 sys.exit(f"API error {resp.status_code} calling {path}: {resp.text}")
             return resp.json() if resp.text else {}
-        sys.exit(f"Gave up after repeated rate limiting calling {path}.")
+        sys.exit(f"Gave up after repeated retries calling {path}.")
 
     def get(self, path, **kwargs):
         return self.request("GET", path, **kwargs)
@@ -333,7 +358,9 @@ def fetch_queue_rows(client, queue_id, start_utc, end_utc):
     """Run the chunked aggregates query for one queue across the full date
     range and return its rows dict, keyed on UTC interval_start."""
     rows = defaultdict(lambda: {"offered": 0, "handled": 0, "handle_time": 0.0})
-    for chunk_start_utc, chunk_end_utc in date_chunks(start_utc, end_utc, CHUNK_DAYS):
+    for i, (chunk_start_utc, chunk_end_utc) in enumerate(date_chunks(start_utc, end_utc, CHUNK_DAYS)):
+        if i > 0 and REQUEST_PACING_SECONDS:
+            time.sleep(REQUEST_PACING_SECONDS)
         print(f"    chunk {chunk_start_utc.date()} -> {chunk_end_utc.date()} (UTC) ...")
         results = fetch_aggregates(client, queue_id, chunk_start_utc, chunk_end_utc)
         process_results(results, rows)
@@ -384,7 +411,9 @@ def main():
     combined_rows = []
     per_queue_totals = []
 
-    for queue_id, queue_name in queues:
+    for i, (queue_id, queue_name) in enumerate(queues):
+        if i > 0 and QUEUE_PACING_SECONDS:
+            time.sleep(QUEUE_PACING_SECONDS)
         print(f"\n  -- {queue_name} --")
         rows = fetch_queue_rows(client, queue_id, start_utc, end_utc)
 

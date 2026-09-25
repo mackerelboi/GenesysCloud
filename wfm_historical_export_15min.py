@@ -44,12 +44,14 @@ How it works
    resolved to its queue ID as you enter it, so a typo is caught
    immediately rather than after the whole run.
 3. Asks once (applies to every queue in this run) for the number of weeks
-   back to pull (max 52) and the IANA time zone for interval bucketing.
+   back to pull (max 52).
 4. Runs the aggregates query per queue, in <=7-day chunks (to stay well
    under any per-request interval/bucket-count limit), with granularity
-   PT15M and a filter on that queue's ID and mediaType=voice, and timeZone
-   set to the IANA zone you provide so interval boundaries land on
-   local-time quarter-hours.
+   PT15M and a filter on that queue's ID and mediaType=voice. No timeZone
+   parameter is sent, so Genesys Cloud returns interval boundaries and
+   timestamps natively in UTC ('Z'-suffixed) -- this removes the need to
+   pick a time zone up front, and means the output file can be plugged
+   straight into WFM later without worrying about local offsets or DST.
 5. Writes ONE combined CSV covering every queue you entered (each row still
    carries its own Queue name, so they can be told apart/filtered), plus a
    totals breakdown printed to the console -- overall and per queue -- so
@@ -58,7 +60,7 @@ How it works
 
 Output file naming
 -------------------
-The output file name encodes the actual date range queried (local dates),
+The output file name encodes the actual date range queried (UTC dates),
 not the queue name, since one run can now cover several queues:
 
     15_Min_Intervals_<start-date>_to_<end-date>.csv
@@ -72,8 +74,10 @@ from the output CSV, sum that day's Offered / Interactions Handled / Total
 Handle Time for one queue, and compare against the Queue Performance Detail
 view for that same queue, day and media type (voice) in the Genesys Cloud
 UI. They should match closely. If they don't, the most likely causes are:
-  - Time zone: this script buckets using the IANA zone you enter; make sure
-    it's the same zone your report view is displaying in.
+  - Time zone: this script's output is in UTC, but the Queue Performance
+    Detail view in the Genesys Cloud UI is normally displayed in your local
+    time zone. Convert one or the other before comparing a given day, or
+    the day boundary will be off by an hour (BST) or won't line up at all.
   - Genesys Cloud's own "recalculation window" can revise recent data for a
     short period after conversations complete -- a same-day comparison for
     "today" can show small drift; compare a fully completed prior day.
@@ -109,7 +113,6 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -273,11 +276,13 @@ def fmt_iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def fetch_aggregates(client, queue_id, chunk_start, chunk_end, tz_name):
+def fetch_aggregates(client, queue_id, chunk_start, chunk_end):
     body = {
         "interval": f"{fmt_iso(chunk_start)}/{fmt_iso(chunk_end)}",
         "granularity": GRANULARITY,
-        "timeZone": tz_name,
+        # No "timeZone" param -- Genesys Cloud then returns interval
+        # boundaries natively in UTC ('Z'-suffixed), which is what we want
+        # for a timezone-free, DST-proof output file.
         "filter": {
             "type": "and",
             "predicates": [
@@ -291,13 +296,11 @@ def fetch_aggregates(client, queue_id, chunk_start, chunk_end, tz_name):
     return data.get("results", [])
 
 
-def parse_interval_start(interval_str, tz):
+def parse_interval_start(interval_str):
     """Genesys interval strings look like
-    '2026-09-15T09:00:00.000Z/2026-09-15T09:15:00.000Z' when no timeZone is
-    given, but return the LOCAL offset (e.g. '...+01:00') once a timeZone
-    parameter is supplied on the query, so we can't assume 'Z'. Parse
-    whichever form comes back and return the start, converted to the
-    requested local time zone, naive for display."""
+    '2026-09-15T09:00:00.000Z/2026-09-15T09:15:00.000Z'. Since no timeZone
+    parameter is sent on the query, these always come back 'Z'-suffixed
+    UTC. Parsed defensively so an explicit offset would also still work."""
     start_str = interval_str.split("/")[0]
     # datetime.fromisoformat handles both 'Z' (after normalizing to
     # '+00:00') and explicit '+HH:MM' offsets, across Python 3.9+.
@@ -306,14 +309,14 @@ def parse_interval_start(interval_str, tz):
         dt = datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise ValueError(f"Unrecognized interval format: {interval_str!r}") from exc
-    return dt.astimezone(tz).replace(tzinfo=None)
+    return dt.astimezone(timezone.utc)
 
 
-def process_results(results, tz, rows):
-    """rows: dict keyed on interval_start -> {"offered":..,"handled":..,"handle_time":..}"""
+def process_results(results, rows):
+    """rows: dict keyed on interval_start (UTC) -> {"offered":..,"handled":..,"handle_time":..}"""
     for result in results:
         for entry in result.get("data", []):
-            interval_start = parse_interval_start(entry["interval"], tz)
+            interval_start = parse_interval_start(entry["interval"])
             row = rows[interval_start]
             for metric in entry.get("metrics", []):
                 name = metric.get("metric")
@@ -326,16 +329,14 @@ def process_results(results, tz, rows):
                     row["handle_time"] += (stats.get("sum", 0) or 0) / 1000.0
 
 
-def fetch_queue_rows(client, queue_id, start_local, end_local, tz, tz_name):
+def fetch_queue_rows(client, queue_id, start_utc, end_utc):
     """Run the chunked aggregates query for one queue across the full date
-    range and return its rows dict, keyed on local interval_start."""
+    range and return its rows dict, keyed on UTC interval_start."""
     rows = defaultdict(lambda: {"offered": 0, "handled": 0, "handle_time": 0.0})
-    for chunk_start_local, chunk_end_local in date_chunks(start_local, end_local, CHUNK_DAYS):
-        print(f"    chunk {chunk_start_local.date()} -> {chunk_end_local.date()} ...")
-        chunk_start_utc = chunk_start_local.astimezone(timezone.utc)
-        chunk_end_utc = chunk_end_local.astimezone(timezone.utc)
-        results = fetch_aggregates(client, queue_id, chunk_start_utc, chunk_end_utc, tz_name)
-        process_results(results, tz, rows)
+    for chunk_start_utc, chunk_end_utc in date_chunks(start_utc, end_utc, CHUNK_DAYS):
+        print(f"    chunk {chunk_start_utc.date()} -> {chunk_end_utc.date()} (UTC) ...")
+        results = fetch_aggregates(client, queue_id, chunk_start_utc, chunk_end_utc)
+        process_results(results, rows)
     return rows
 
 
@@ -366,33 +367,18 @@ def main():
             pass
         print(f"  please enter a whole number between 1 and {MAX_WEEKS}.")
 
-    tz_input = input(
-        "Time zone for interval bucketing, as an IANA name matching what "
-        "your Genesys Cloud report is displayed in (e.g. Europe/London) "
-        "[default Europe/London]: "
-    ).strip()
-    tz_name = tz_input or "Europe/London"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        sys.exit(
-            f"Could not load time zone '{tz_name}'. On Windows you may need "
-            "to run: pip install tzdata"
-        )
+    # Round the query range to clean 15-minute boundaries in UTC before
+    # building the query. If the range starts/ends at an arbitrary instant
+    # (e.g. "now" with odd seconds/microseconds), every 15-minute bucket
+    # Genesys returns inherits that same offset instead of landing on
+    # :00/:15/:30/:45 -- which is what produced misaligned intervals like
+    # '10:44:22' instead of '10:45:00'.
+    now_utc = datetime.now(timezone.utc)
+    end_utc = now_utc.replace(second=0, microsecond=0)
+    end_utc = end_utc.replace(minute=(end_utc.minute // INTERVAL_MINUTES) * INTERVAL_MINUTES)
+    start_utc = end_utc - timedelta(weeks=weeks)
 
-    # Round the query range to clean 15-minute boundaries in LOCAL time
-    # before building the query. If the range starts/ends at an arbitrary
-    # instant (e.g. "now" with odd seconds/microseconds), every 15-minute
-    # bucket Genesys returns inherits that same offset instead of landing
-    # on :00/:15/:30/:45 -- which is what produced misaligned intervals
-    # like '10:44:22' instead of '10:45:00'.
-    now_local = datetime.now(tz)
-    end_local = now_local.replace(second=0, microsecond=0)
-    end_local = end_local.replace(minute=(end_local.minute // INTERVAL_MINUTES) * INTERVAL_MINUTES)
-    start_local = end_local - timedelta(weeks=weeks)
-
-    print(f"\nQuerying aggregates from {start_local} to {end_local} "
-          f"(local time, {tz_name})...")
+    print(f"\nQuerying aggregates from {start_utc} to {end_utc} (UTC)...")
 
     # combined_rows: list of (interval_start, queue_name, offered, handled, handle_time_seconds)
     combined_rows = []
@@ -400,7 +386,7 @@ def main():
 
     for queue_id, queue_name in queues:
         print(f"\n  -- {queue_name} --")
-        rows = fetch_queue_rows(client, queue_id, start_local, end_local, tz, tz_name)
+        rows = fetch_queue_rows(client, queue_id, start_utc, end_utc)
 
         if not rows:
             print(f"    no data found for '{queue_name}' in this date range.")
@@ -429,8 +415,8 @@ def main():
     # Sort the combined output by queue, then chronologically within each queue.
     combined_rows.sort(key=lambda r: (r[1], r[0]))
 
-    start_date_str = start_local.date().isoformat()
-    end_date_str = end_local.date().isoformat()
+    start_date_str = start_utc.date().isoformat()
+    end_date_str = end_utc.date().isoformat()
     out_path = f"15_Min_Intervals_{start_date_str}_to_{end_date_str}.csv"
 
     with open(out_path, "w", newline="") as f:
@@ -449,7 +435,7 @@ def main():
         for interval_start, queue_name, offered, handled, handle_time_seconds in combined_rows:
             writer.writerow(
                 [
-                    interval_start.strftime("%Y-%m-%d %H:%M"),
+                    interval_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                     queue_name,
                     MEDIA_TYPE,
                     LANGUAGE,

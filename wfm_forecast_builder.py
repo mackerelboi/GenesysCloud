@@ -29,6 +29,20 @@ For each queue found in the input file:
     fabricated for it. Different queues can therefore end up with
     different operating patterns in the output, which is intentional.
 
+Operating-hours cap and Sundays
+--------------------------------
+Regardless of what the historical data shows, the output is capped to a
+fixed operating-hours window, expressed directly in UTC:
+    Monday-Friday : 07:00-21:00 UTC
+    Saturday      : 08:00-15:00 UTC
+    Sunday        : 08:00-15:00 UTC
+Any Monday-Saturday historical slot that would fall outside its day's
+window is dropped. Sundays are handled differently: every Sunday in the
+forecast range gets a full set of 15-minute rows across 08:00-15:00 UTC
+for every planning group, with Offered, Interactions Handled and Average
+Handle Time all set to 0 -- i.e. Sundays are deliberately left blank for
+now, not derived from history.
+
 Time zone handling
 -------------------
 Both the input and output files are pure UTC -- there is no time zone
@@ -74,6 +88,20 @@ INTERNAL_TZ_NAME = "Europe/London"
 INTERNAL_TZ = ZoneInfo(INTERNAL_TZ_NAME)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Operating hours the output is capped to, expressed directly in UTC clock
+# time (half-open: start included, end excluded), per weekday. Any
+# generated slot outside its day's window is dropped.
+OPERATING_WINDOWS_UTC = {
+    "Monday": ("07:00", "21:00"),
+    "Tuesday": ("07:00", "21:00"),
+    "Wednesday": ("07:00", "21:00"),
+    "Thursday": ("07:00", "21:00"),
+    "Friday": ("07:00", "21:00"),
+    "Saturday": ("08:00", "15:00"),
+    "Sunday": ("08:00", "15:00"),
+}
+SUNDAY_INTERVAL_MINUTES = 15  # Sundays are zero-filled at this granularity
 
 MONTH_NAMES = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
@@ -203,6 +231,33 @@ def to_utc_iso(local_date, time_str, tz):
     local_aware = local_naive.replace(tzinfo=tz)
     utc_dt = local_aware.astimezone(ZoneInfo("UTC"))
     return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def in_operating_window(weekday, utc_time_str):
+    """weekday: 'Monday'..'Sunday'. utc_time_str: 'HH:MM' in UTC. Half-open
+    [start, end) comparison works directly on zero-padded 'HH:MM' strings."""
+    window = OPERATING_WINDOWS_UTC.get(weekday)
+    if not window:
+        return False
+    start_str, end_str = window
+    return start_str <= utc_time_str < end_str
+
+
+def sunday_utc_slot_times():
+    """All 'HH:MM' slot start times (UTC) within the Sunday window, at
+    SUNDAY_INTERVAL_MINUTES spacing."""
+    start_str, end_str = OPERATING_WINDOWS_UTC["Sunday"]
+    start_h, start_m = map(int, start_str.split(":"))
+    end_h, end_m = map(int, end_str.split(":"))
+    start_total = start_h * 60 + start_m
+    end_total = end_h * 60 + end_m
+    times = []
+    t = start_total
+    while t < end_total:
+        h, m = divmod(t, 60)
+        times.append(f"{h:02d}:{m:02d}")
+        t += SUNDAY_INTERVAL_MINUTES
+    return times
 
 
 # --------------------------------------------------------------------------
@@ -354,23 +409,43 @@ def main():
         weekdays_present = sorted({k[0] for k in pattern})
 
         n_rows_for_group = 0
+        n_sunday_zero_rows = 0
+        n_dropped_outside_window = 0
         for d in forecast_dates(start_date, weeks):
             weekday = d.strftime("%A")
+
+            # Sundays are always zero-filled at the fixed 08:00-15:00 UTC
+            # window, regardless of what the queue's own history shows.
+            if weekday == "Sunday":
+                for time_str in sunday_utc_slot_times():
+                    utc_iso = f"{d.isoformat()}T{time_str}:00.000Z"
+                    all_output_rows.append((utc_iso, planning_group, 0, 0))
+                    n_rows_for_group += 1
+                    n_sunday_zero_rows += 1
+                continue
+
             if weekday not in weekdays_present:
                 continue
             matching_keys = [k for k in pattern if k[0] == weekday]
             for (wd, time_str) in matching_keys:
+                utc_iso = to_utc_iso(d, time_str, INTERNAL_TZ)
+                utc_time_str = utc_iso[11:16]  # 'HH:MM' from the ISO string
+                if not in_operating_window(weekday, utc_time_str):
+                    n_dropped_outside_window += 1
+                    continue
                 stats = pattern[(wd, time_str)]
                 offered_forecast = max(0, round(stats["offered"] * multiplier))
                 aht_forecast = max(0, round(stats["aht"]))  # never scaled by multiplier
-                utc_iso = to_utc_iso(d, time_str, INTERNAL_TZ)
                 all_output_rows.append((utc_iso, planning_group, offered_forecast, aht_forecast))
                 n_rows_for_group += 1
 
         print(f"{planning_group} (queue '{queue_name}'): {n_rows_for_group} forecast rows "
               f"generated from {len(pattern)} distinct historical (weekday, time) slots "
               f"across historical weekdays: {', '.join(weekdays_present)}; "
-              f"multiplier x{multiplier:g}")
+              f"multiplier x{multiplier:g} "
+              f"({n_sunday_zero_rows} Sunday zero-filled rows, "
+              f"{n_dropped_outside_window} historical slots dropped for falling "
+              f"outside the operating-hours window)")
 
     if not all_output_rows:
         sys.exit("\nNo forecast rows were generated -- nothing to write.")

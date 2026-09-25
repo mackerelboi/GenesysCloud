@@ -31,13 +31,19 @@ For each queue found in the input file:
 
 Time zone handling
 -------------------
-The input file's timestamps are UTC. To build sensible (weekday, local
-time-of-day) pattern keys -- and to project the forecast onto the correct
-UTC instant for each local slot, including across the British Summer
-Time <-> GMT clock change -- this script converts UTC to a local IANA time
-zone internally (default Europe/London, overridable). This is purely
-internal bucketing/projection logic: nothing about time zones needs to be
-selected or considered downstream, because the output file is UTC again.
+Both the input and output files are pure UTC -- there is no time zone
+prompt. Internally, this script still converts UTC to Europe/London
+(hardcoded) purely to build sensible (weekday, local time-of-day) pattern
+keys and to project the forecast onto the correct UTC instant for each
+slot across the British Summer Time <-> GMT clock change -- otherwise a
+slot's UTC offset would be wrong on one side of the DST boundary. This is
+invisible bucketing/projection logic only; nothing about time zones needs
+to be entered or considered by you.
+
+Input file location
+--------------------
+Just give the file name (e.g. 15_Min_Intervals_2026-06-29_to_2026-09-25.csv)
+-- it's expected to be in the same folder as this script.
 
 Output
 ------
@@ -51,6 +57,7 @@ Usage
 """
 
 import csv
+import os
 import re
 import sys
 from collections import defaultdict
@@ -58,7 +65,15 @@ from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
 
 DEFAULT_WEEKS = 6
-DEFAULT_TZ_NAME = "Europe/London"
+
+# Used only internally, to bucket UTC timestamps into sensible (weekday,
+# local time-of-day) pattern keys and to project the forecast back onto
+# the correct UTC instant either side of the BST/GMT clock change. Not
+# asked about or exposed anywhere -- input and output are both pure UTC.
+INTERNAL_TZ_NAME = "Europe/London"
+INTERNAL_TZ = ZoneInfo(INTERNAL_TZ_NAME)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MONTH_NAMES = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
@@ -194,27 +209,23 @@ def to_utc_iso(local_date, time_str, tz):
 # Prompts
 # --------------------------------------------------------------------------
 
-def prompt_input_path():
+def prompt_input_filename():
+    """Asks for just a file name (no path) and resolves it against the
+    folder this script itself is running from."""
     while True:
-        path = input("Path to the historical export CSV: ").strip().strip('"')
-        if path:
-            return path
-        print("  please enter a file path.")
-
-
-def prompt_tz_name():
-    tz_input = input(
-        f"Local time zone for building day/time patterns and projecting "
-        f"the forecast (IANA name, e.g. Europe/London) [default {DEFAULT_TZ_NAME}]: "
-    ).strip()
-    tz_name = tz_input or DEFAULT_TZ_NAME
-    try:
-        return tz_name, ZoneInfo(tz_name)
-    except Exception:
-        sys.exit(
-            f"Could not load time zone '{tz_name}'. On Windows you may need "
-            "to run: pip install tzdata"
-        )
+        name = input(
+            "Historical export CSV file name (must be in the same folder "
+            "as this script): "
+        ).strip().strip('"')
+        if not name:
+            print("  please enter a file name.")
+            continue
+        full_path = os.path.join(SCRIPT_DIR, name)
+        if not os.path.isfile(full_path):
+            print(f"  couldn't find '{name}' in {SCRIPT_DIR} -- check the "
+                  "file is there and the name (including .csv) is exact.")
+            continue
+        return full_path
 
 
 def parse_flexible_date(text):
@@ -313,19 +324,17 @@ def prompt_multiplier(planning_group):
 def main():
     print("=== WFM Forecast Builder (flat average, per-queue multiplier) ===\n")
 
-    input_path = prompt_input_path()
-    tz_name, tz = prompt_tz_name()
+    input_path = prompt_input_filename()
 
-    print(f"\nReading '{input_path}' (interpreting UTC timestamps in {tz_name} "
-          f"for day/time pattern detection)...")
-    by_queue = load_input_file(input_path, tz)
+    print(f"\nReading '{os.path.basename(input_path)}'...")
+    by_queue = load_input_file(input_path, INTERNAL_TZ)
     queue_names = sorted(by_queue.keys())
     print(f"  found {len(queue_names)} queue(s): {', '.join(queue_names)}")
 
     start_date = prompt_start_date()
     weeks = prompt_weeks()
     print(f"\nForecast will run from {start_date.isoformat()} for {weeks} week(s) "
-          f"({weeks * 7} calendar days), local time zone {tz_name}.\n")
+          f"({weeks * 7} calendar days), all times in UTC.\n")
 
     queue_configs = []  # (queue_name, planning_group, multiplier)
     for queue_name in queue_names:
@@ -354,7 +363,7 @@ def main():
                 stats = pattern[(wd, time_str)]
                 offered_forecast = max(0, round(stats["offered"] * multiplier))
                 aht_forecast = max(0, round(stats["aht"]))  # never scaled by multiplier
-                utc_iso = to_utc_iso(d, time_str, tz)
+                utc_iso = to_utc_iso(d, time_str, INTERNAL_TZ)
                 all_output_rows.append((utc_iso, planning_group, offered_forecast, aht_forecast))
                 n_rows_for_group += 1
 
